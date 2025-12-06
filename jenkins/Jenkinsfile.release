@@ -1,0 +1,171 @@
+pipeline {
+    agent any
+    
+    environment {
+        DOCKER_IMAGE = "devops-task-manager"
+        CONTAINER_NAME = "task-manager-release-${BUILD_NUMBER}"
+        PROD_PORT = "3000"
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                echo '📥 Récupération de la version taggée...'
+                checkout scm
+                script {
+                    def tagOutput = bat(
+                        script: '@git describe --tags --abbrev=0 2>nul || echo v1.0.0',
+                        returnStdout: true
+                    ).trim()
+                    env.VERSION_TAG = tagOutput
+                    env.VERSION_NUMBER = tagOutput.replaceAll('v', '')
+                    
+                    env.GIT_COMMIT_SHORT = bat(
+                        script: '@git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                }
+                echo "✅ Version: ${env.VERSION_TAG} | Commit: ${env.GIT_COMMIT_SHORT}"
+            }
+        }
+        
+        stage('Setup') {
+            steps {
+                echo '⚙️  Préparation du build release...'
+                bat """
+                    echo 📦 Version: %VERSION_TAG%
+                    echo 📦 Build: %BUILD_NUMBER%
+                    node --version
+                    docker --version
+                """
+            }
+        }
+        
+        stage('Build') {
+            parallel {
+                stage('Build Production') {
+                    steps {
+                        echo '🔨 Construction de l\'image production...'
+                        bat """
+                            docker build -t %DOCKER_IMAGE%:%VERSION_NUMBER% .
+                            docker tag %DOCKER_IMAGE%:%VERSION_NUMBER% %DOCKER_IMAGE%:latest
+                            echo ✅ Images créées: %DOCKER_IMAGE%:%VERSION_NUMBER% et latest
+                        """
+                    }
+                }
+                stage('Build Staging') {
+                    steps {
+                        echo '🔨 Construction de l\'image staging...'
+                        bat """
+                            docker build -t %DOCKER_IMAGE%:%VERSION_NUMBER%-staging .
+                            echo ✅ Image staging créée
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Run') {
+            steps {
+                echo '🚀 Démarrage du conteneur release...'
+                bat """
+                    docker run -d ^
+                        --name %CONTAINER_NAME% ^
+                        -p %PROD_PORT%:3000 ^
+                        %DOCKER_IMAGE%:%VERSION_NUMBER%
+                    
+                    echo ✅ Conteneur démarré sur le port %PROD_PORT%
+                    echo ⏳ Attente de la disponibilité...
+                    ping -n 16 127.0.0.1 > nul
+                """
+            }
+        }
+        
+        stage('Smoke Test') {
+            steps {
+                echo '🔥 Exécution des tests smoke production...'
+                bat """
+                    set TEST_URL=http://localhost:%PROD_PORT%
+                    node tests/smoke-test.js
+                """
+            }
+        }
+        
+        stage('Archive Artifacts') {
+            steps {
+                echo '📦 Archivage des artefacts release...'
+                bat """
+                    if not exist artifacts\\releases\\%VERSION_NUMBER% mkdir artifacts\\releases\\%VERSION_NUMBER%
+                    
+                    docker logs %CONTAINER_NAME% > artifacts\\releases\\%VERSION_NUMBER%\\production-logs.txt 2>&1
+                    
+                    (
+                        echo ================================================
+                        echo 🚀 RELEASE NOTES - Version %VERSION_TAG%
+                        echo ================================================
+                        echo.
+                        echo Version:        %VERSION_NUMBER%
+                        echo Tag Git:        %VERSION_TAG%
+                        echo Build Number:   %BUILD_NUMBER%
+                        echo Commit:         %GIT_COMMIT_SHORT%
+                        echo Date:           %DATE% %TIME%
+                        echo.
+                        echo Images Docker:
+                        echo - %DOCKER_IMAGE%:%VERSION_NUMBER%
+                        echo - %DOCKER_IMAGE%:%VERSION_NUMBER%-staging
+                        echo - %DOCKER_IMAGE%:latest
+                        echo.
+                        echo Status: ✅ SUCCESS - Ready for deployment
+                        echo ================================================
+                    ) > artifacts\\releases\\%VERSION_NUMBER%\\RELEASE-NOTES.txt
+                    
+                    docker inspect %DOCKER_IMAGE%:%VERSION_NUMBER% > artifacts\\releases\\%VERSION_NUMBER%\\image-manifest.json
+                    docker images | findstr %DOCKER_IMAGE% > artifacts\\releases\\%VERSION_NUMBER%\\images-list.txt
+                    
+                    (
+                        echo @echo off
+                        echo docker pull %DOCKER_IMAGE%:%VERSION_NUMBER%
+                        echo docker stop task-manager-prod 2^>nul
+                        echo docker rm task-manager-prod 2^>nul
+                        echo docker run -d --name task-manager-prod -p 80:3000 %DOCKER_IMAGE%:%VERSION_NUMBER%
+                        echo echo ✅ Déploiement terminé
+                    ) > artifacts\\releases\\%VERSION_NUMBER%\\deploy.bat
+                """
+                
+                archiveArtifacts artifacts: 'artifacts/**/*', fingerprint: true
+                echo '✅ Artefacts archivés dans Jenkins'
+            }
+        }
+        
+        stage('Cleanup') {
+            steps {
+                echo '🧹 Nettoyage...'
+                bat """
+                    docker stop %CONTAINER_NAME% 2>nul || exit /b 0
+                    docker rm %CONTAINER_NAME% 2>nul || exit /b 0
+                    echo ✅ Nettoyage terminé - Images conservées
+                """
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo '✅ ================================================='
+            echo '✅ PIPELINE RELEASE TERMINÉ AVEC SUCCÈS!'
+            echo "✅ Version: ${env.VERSION_TAG}"
+            echo '✅ ================================================='
+        }
+        failure {
+            echo '❌ ================================================='
+            echo '❌ PIPELINE RELEASE ÉCHOUÉ!'
+            echo '❌ ================================================='
+        }
+        always {
+            bat """
+                docker stop %CONTAINER_NAME% 2>nul || exit /b 0
+                docker rm %CONTAINER_NAME% 2>nul || exit /b 0
+            """
+        }
+    }
+}

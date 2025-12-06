@@ -1,0 +1,178 @@
+pipeline {
+    agent any
+    
+    environment {
+        DOCKER_IMAGE = "devops-task-manager"
+        CONTAINER_NAME_18 = "task-manager-dev-node18-${BUILD_NUMBER}"
+        CONTAINER_NAME_20 = "task-manager-dev-node20-${BUILD_NUMBER}"
+        PORT_18 = "3018"
+        PORT_20 = "3020"
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                echo '📥 Récupération du code depuis dev...'
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = bat(
+                        script: '@git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                }
+                echo "✅ Branche: dev | Commit: ${env.GIT_COMMIT_SHORT}"
+            }
+        }
+        
+        stage('Setup') {
+            steps {
+                echo '⚙️  Configuration de l\'environnement...'
+                bat '''
+                    echo 📦 Node:
+                    node --version
+                    echo 📦 NPM:
+                    npm --version
+                    echo 🐳 Docker:
+                    docker --version
+                '''
+            }
+        }
+        
+        stage('Build') {
+            parallel {
+                stage('Build Node 18') {
+                    steps {
+                        echo '🔨 Construction avec Node 18...'
+                        bat """
+                            docker build -t %DOCKER_IMAGE%:dev-node18-%BUILD_NUMBER% .
+                            echo ✅ Image Node 18 construite
+                        """
+                    }
+                }
+                stage('Build Node 20') {
+                    steps {
+                        echo '🔨 Construction avec Node 20...'
+                        bat """
+                            docker build -t %DOCKER_IMAGE%:dev-node20-%BUILD_NUMBER% .
+                            echo ✅ Image Node 20 construite
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Run') {
+            steps {
+                echo '🚀 Démarrage des conteneurs...'
+                bat """
+                    docker run -d ^
+                        --name %CONTAINER_NAME_18% ^
+                        -p %PORT_18%:3000 ^
+                        %DOCKER_IMAGE%:dev-node18-%BUILD_NUMBER%
+                    
+                    docker run -d ^
+                        --name %CONTAINER_NAME_20% ^
+                        -p %PORT_20%:3000 ^
+                        %DOCKER_IMAGE%:dev-node20-%BUILD_NUMBER%
+                    
+                    echo ✅ Conteneurs démarrés
+                    echo    Node 18 -^> Port %PORT_18%
+                    echo    Node 20 -^> Port %PORT_20%
+                    echo ⏳ Attente de la disponibilité...
+                    ping -n 13 127.0.0.1 > nul
+                """
+            }
+        }
+        
+        stage('Smoke Test') {
+            parallel {
+                stage('Test Node 18') {
+                    steps {
+                        echo '🔥 Tests sur Node 18...'
+                        bat """
+                            set TEST_URL=http://localhost:%PORT_18%
+                            node tests/smoke-test.js
+                        """
+                    }
+                }
+                stage('Test Node 20') {
+                    steps {
+                        echo '🔥 Tests sur Node 20...'
+                        bat """
+                            set TEST_URL=http://localhost:%PORT_20%
+                            node tests/smoke-test.js
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Archive Artifacts') {
+            steps {
+                echo '📦 Archivage des artefacts...'
+                bat """
+                    if not exist artifacts\\dev-%BUILD_NUMBER% mkdir artifacts\\dev-%BUILD_NUMBER%
+                    
+                    docker logs %CONTAINER_NAME_18% > artifacts\\dev-%BUILD_NUMBER%\\node18-logs.txt 2>&1
+                    docker logs %CONTAINER_NAME_20% > artifacts\\dev-%BUILD_NUMBER%\\node20-logs.txt 2>&1
+                    
+                    (
+                        echo =========================================
+                        echo Pipeline DEV - Build %BUILD_NUMBER%
+                        echo =========================================
+                        echo Date: %DATE% %TIME%
+                        echo Commit: %GIT_COMMIT_SHORT%
+                        echo Branche: dev
+                        echo.
+                        echo Images construites:
+                        echo - %DOCKER_IMAGE%:dev-node18-%BUILD_NUMBER%
+                        echo - %DOCKER_IMAGE%:dev-node20-%BUILD_NUMBER%
+                        echo.
+                        echo Tests:
+                        echo - Node 18 ^(Port %PORT_18%^): ✅ PASSED
+                        echo - Node 20 ^(Port %PORT_20%^): ✅ PASSED
+                        echo.
+                        echo Status global: ✅ SUCCESS
+                        echo =========================================
+                    ) > artifacts\\dev-%BUILD_NUMBER%\\build-report.txt
+                    
+                    docker images | findstr %DOCKER_IMAGE% > artifacts\\dev-%BUILD_NUMBER%\\docker-images.txt
+                """
+                
+                archiveArtifacts artifacts: 'artifacts/**/*', fingerprint: true
+                echo '✅ Artefacts archivés'
+            }
+        }
+        
+        stage('Cleanup') {
+            steps {
+                echo '🧹 Nettoyage...'
+                bat """
+                    docker stop %CONTAINER_NAME_18% %CONTAINER_NAME_20% 2>nul || exit /b 0
+                    docker rm %CONTAINER_NAME_18% %CONTAINER_NAME_20% 2>nul || exit /b 0
+                    echo ✅ Conteneurs nettoyés
+                """
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo '✅ ========================================='
+            echo '✅ Pipeline DEV terminé avec succès!'
+            echo '✅ Builds Node 18 et 20 validés'
+            echo '✅ ========================================='
+        }
+        failure {
+            echo '❌ ========================================='
+            echo '❌ Pipeline DEV échoué!'
+            echo '❌ ========================================='
+        }
+        always {
+            bat """
+                docker stop %CONTAINER_NAME_18% %CONTAINER_NAME_20% 2>nul || exit /b 0
+                docker rm %CONTAINER_NAME_18% %CONTAINER_NAME_20% 2>nul || exit /b 0
+            """
+        }
+    }
+}

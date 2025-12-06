@@ -1,0 +1,134 @@
+pipeline {
+    agent any
+    
+    environment {
+        DOCKER_IMAGE = "devops-task-manager"
+        CONTAINER_NAME = "task-manager-pr-${BUILD_NUMBER}"
+        TEST_PORT = "3001"
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                echo '📥 Récupération du code source...'
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = bat(
+                        script: '@git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                }
+                echo "✅ Commit: ${env.GIT_COMMIT_SHORT}"
+            }
+        }
+        
+        stage('Setup') {
+            steps {
+                echo '⚙️  Configuration de l\'environnement...'
+                bat '''
+                    echo 📦 Node: 
+                    node --version
+                    echo 📦 NPM: 
+                    npm --version
+                    echo 🐳 Docker: 
+                    docker --version
+                '''
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                echo '🔨 Construction de l\'image Docker...'
+                bat """
+                    docker build -t %DOCKER_IMAGE%:pr-%BUILD_NUMBER% .
+                    echo ✅ Image construite: %DOCKER_IMAGE%:pr-%BUILD_NUMBER%
+                """
+            }
+        }
+        
+        stage('Run') {
+            steps {
+                echo '🚀 Démarrage du conteneur...'
+                bat """
+                    docker run -d ^
+                        --name %CONTAINER_NAME% ^
+                        -p %TEST_PORT%:3000 ^
+                        %DOCKER_IMAGE%:pr-%BUILD_NUMBER%
+                    
+                    echo ✅ Conteneur démarré sur le port %TEST_PORT%
+                    echo ⏳ Attente de la disponibilité...
+                    ping -n 11 127.0.0.1 > nul
+                """
+            }
+        }
+        
+        stage('Smoke Test') {
+            steps {
+                echo '🔥 Exécution des smoke tests...'
+                bat """
+                    set TEST_URL=http://localhost:%TEST_PORT%
+                    node tests/smoke-test.js
+                """
+            }
+        }
+        
+        stage('Archive Artifacts') {
+            steps {
+                echo '📦 Archivage des artefacts...'
+                bat """
+                    if not exist artifacts\\pr-%BUILD_NUMBER% mkdir artifacts\\pr-%BUILD_NUMBER%
+                    
+                    docker logs %CONTAINER_NAME% > artifacts\\pr-%BUILD_NUMBER%\\container-logs.txt 2>&1
+                    
+                    (
+                        echo =================================
+                        echo Pipeline PR - Build %BUILD_NUMBER%
+                        echo =================================
+                        echo Date: %DATE% %TIME%
+                        echo Commit: %GIT_COMMIT_SHORT%
+                        echo Image: %DOCKER_IMAGE%:pr-%BUILD_NUMBER%
+                        echo Port: %TEST_PORT%
+                        echo Status: ✅ PASSED
+                        echo =================================
+                    ) > artifacts\\pr-%BUILD_NUMBER%\\build-info.txt
+                    
+                    docker images | findstr %DOCKER_IMAGE% > artifacts\\pr-%BUILD_NUMBER%\\docker-images.txt
+                """
+                
+                archiveArtifacts artifacts: 'artifacts/**/*', fingerprint: true
+                echo '✅ Artefacts archivés avec succès'
+            }
+        }
+        
+        stage('Cleanup') {
+            steps {
+                echo '🧹 Nettoyage...'
+                bat """
+                    docker stop %CONTAINER_NAME% 2>nul || exit /b 0
+                    docker rm %CONTAINER_NAME% 2>nul || exit /b 0
+                    docker rmi %DOCKER_IMAGE%:pr-%BUILD_NUMBER% 2>nul || exit /b 0
+                    echo ✅ Nettoyage terminé
+                """
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo '✅ ========================================='
+            echo '✅ Pipeline PR terminé avec succès!'
+            echo '✅ ========================================='
+        }
+        failure {
+            echo '❌ ========================================='
+            echo '❌ Pipeline PR échoué!'
+            echo '❌ ========================================='
+        }
+        always {
+            bat """
+                docker stop %CONTAINER_NAME% 2>nul || exit /b 0
+                docker rm %CONTAINER_NAME% 2>nul || exit /b 0
+            """
+        }
+    }
+}
